@@ -1,0 +1,254 @@
+# Esquema Integral de Conexionado: Multímetro con Arduino (v0.9 PI)
+
+Este documento detalla la arquitectura de interconexión física, acondicionamiento de señal analógica, direccionamiento en el bus I2C y pautas de cableado de bajo ruido para el sistema de adquisición metrológica basado en el microcontrolador **Arduino UNO R4 WiFi (Renesas RA4M1)**.
+
+---
+
+## 1. Mapa de Direcciones en el Bus I2C Principal (`Wire`)
+
+Todos los módulos comparten las líneas comunes del bus I2C nativo del Arduino UNO R4 WiFi (**SDA** en Pin D18/A4 y **SCL** en Pin D19/A5).
+
+| Dispositivo / Submódulo | Dirección I2C | Configuración Física de Dirección | Función Principal |
+| :--- | :---: | :--- | :--- |
+| **ADS1115 Moderno** | `0x48` | Pin `ADDR` -> `GND` | Tensión diferencial con buffer MCP6002 |
+| **ADS1115 Clásico** | `0x4A` | Pin `ADDR` -> `SDA` | Tensión diferencial con protección Clamping |
+| **INA219 #1** | `0x40` | Puentes `A0` abierto / `A1` abierto | Monitor de Corriente/Potencia (Fuente a Circuito) |
+| **INA219 #2** | `0x41` | Puente `A0` cerrado (VCC) / `A1` abierto | Monitor de Corriente/Potencia (Nodo Libre) |
+| **DS3231 RTC** | `0x68` | Fija interna por hardware | Reloj de tiempo real y sensor de temperatura |
+| **AT24C32 EEPROM** | `0x57` | A0, A1 en VCC / A2 flotante/pullup | Persistencia metrológica con Checksum |
+
+---
+
+## 2. Diagrama de Distribución de Potencia y Bus I2C
+
+Para minimizar desplazamientos de referencia y ruido parásito en mediciones de microvoltios, se debe implementar una topología de **"Tierra Santa" en estrella** (*Star Ground*), derivando los retornos analógicos y de potencia de forma independiente hacia el pin `GND` principal del Arduino.
+
+```text
+                  +-----------------------------------+
+                  |       ARDUINO UNO R4 WiFi         |
+                  |                                   |
+                  |  [+5V]   [GND]   [SDA/D18] [SCL/D19]
+                  +----+-------+---------+--------+---+
+                       |       |         |        |
+    ===================+=======+=========+========+=================== (BUS MAESTRO)
+    |                  |       |         |        |
+    |  +5V (Riel VCC)  |       |         |        |
+    |  GND (Tierra)    o       |         |        |
+    |  SDA ------------+-------+---------o        |
+    |  SCL ------------+-------+------------------o
+    |                  |       |         |        |
+    |             +----+-------+----+    |        |
+    +------------>| VDD       GND  |<----+        |
+    |             |                 |             |
+    |             |  ADS1115 (0x48) |             |
+    |             |  ADDR -> GND    |             |
+    |             |  SDA       SCL  |<------------+ (SCL)
+    |             +---+---------+---+
+    |                 ^         ^
+    |                 |         +-----------------+
+    |                 +------------------+        |
+    |                                    |        |
+    |             +-----------------+    |        |
+    +------------>| VDD       GND  |<----+        |
+    |             |                 |    |        |
+    |             |  ADS1115 (0x4A) |    |        |
+    |             |  ADDR -> SDA    |    |        |
+    |             |  SDA       SCL  |<---+--------o
+    |             +---+---------+---+    |
+    |                 ^                  |
+    |                 +------------------o
+    |
+    |             +-----------------+
+    +------------>| VCC       GND  |<----+
+    |             |                 |    |
+    |             |  INA219 #1 0x40 |    |
+    |             |  SDA       SCL  |<---+--------o
+    |             +---+---------+---+    |        |
+    |                 ^                  |        |
+    |                 +------------------+        |
+    |                                             |
+    |             +-----------------+             |
+    +------------>| VCC       GND  |<----+        |
+    |             |                 |    |        |
+    |             |  INA219 #2 0x41 |    |        |
+    |             |  SDA       SCL  |<---+--------o
+    |             +---+---------+---+    |        |
+    |                 ^                  |        |
+    |                 +------------------+        |
+    |                                             |
+    |             +-----------------+             |
+    +------------>| VCC       GND  |<----+        |
+                  |                 |             |
+                  |  DS3231/AT24C32 |             |
+                  |  SDA       SCL  |<------------+
+                  +-----------------+
+```
+
+---
+
+## 3. Front-End Analógico: ADS1115 Moderno (`0x48`) con MCP6002
+
+El ADS1115 Moderno utiliza amplificadores operacionales **MCP6002** en configuración de seguidor de tensión (*buffer* de ganancia unitaria). Esto aísla la fuente de señal de la impedancia interna de muestreo del convertidor ADC y protege las entradas contra sobretensión (limitando físicamente la excursión al rango de alimentación del operacional: $0\,\text{V}$ a $5\,\text{V}$).
+
+### Esquema por Canal Diferencial (D1: A0-A1 / D2: A2-A3)
+
+```text
+Entrada Punta (+) o Divisor 
+        o-----------------------+
+                                |
+                                |       |\ 
+                                +-------|+ \   MCP6002 (1/2)
+                                        |   \
+                                     +--|-   >--------+-------> A0 (ADS1115 #1)
+                                     |  |   /         |
+                                     +--| _/          |
+                                                      |
+Entrada Punta (-) o Retorno                           |
+        o-----------------------+                     |
+                                |                     |
+                                |       |\            |
+                                +-------|+ \   MCP6002 (2/2)
+                                        |   \         |
+                                     +--|-   >--------+-------> A1 (ADS1115 #1)
+                                     |  |   /
+                                     +--| _/
+                                     
+Alimentación MCP6002:
+   Pin 8 (VDD) -> +5V (con desacoplo cerámico de 100 nF a GND)
+   Pin 4 (VSS) -> GND (Tierra Santa)
+```
+
+---
+
+## 4. Front-End Analógico: ADS1115 Clásico (`0x4A`) con Diodos Clamping
+
+Este módulo emplea una red de protección pasiva por recorte (*clamping*) basada en resistencias de bajo valor y diodos Schottky de conmutación rápida (por ejemplo, BAT43, BAT54 o 1N5819).
+
+### Topología de Protección de Entrada
+
+```text
+                                  +5V (Riel de protección)
+                                   ^
+                                   |
+                                 [ - ] Cátodo
+                                  / \  Diodo Schottky (BAT43)
+                                 ----- Ánodo
+                                   |
+Punta de Entrada (+)               |
+      o-------[ 1 kΩ, 1% ]---------+--------------------------> A0 (ADS1115 #2)
+                                   |
+                                 [ - ] Cátodo
+                                  / \  Diodo Schottky (BAT43)
+                                 ----- Ánodo
+                                   |
+                                   v
+                             GND (Tierra Santa)
+```
+
+> **Nota:** Se replica exactamente la misma red para las entradas A1, A2 y A3 del convertidor clásico.
+
+---
+
+## 5. Módulo "Ejército Resistivo" (Divisores de Tensión Simétricos 33k / 10k)
+
+Para extender el rango de medición hasta $\approx 21.5\,\text{V}$ con alta linealidad, se utiliza un divisor de factor nominal:
+
+$$K_{\text{nominal}} = \frac{R_{\text{superior}} + R_{\text{inferior}}}{R_{\text{inferior}}} = \frac{33\,\text{k}\Omega + 10\,\text{k}\Omega}{10\,\text{k}\Omega} = 4.3000$$
+
+Para no destruir el **CMRR** (Rechazo de Modo Común) del ADC en modo diferencial, los pares de resistencias deben estar estrictamente apareados (*matched*).
+
+```text
+    Bornes de Medición Alta Tensión              Entradas al Buffer / ADC
+    
+    (+) [ V_HIGH + ] o----[ 33 kΩ, 0.1% ]----+
+                                             |
+                                           [10 kΩ, 0.1%]
+                                             |
+                                             +----------> A0 / Buffer In (+)
+                                             |
+    (-) [ V_HIGH - ] o----[ 33 kΩ, 0.1% ]----+
+                                             |
+                                           [10 kΩ, 0.1%]
+                                             |
+                                             +----------> A1 / Buffer In (-)
+                                             |
+                                            === GND (Referencia común)
+```
+
+---
+
+## 6. Monitores de Corriente y Potencia INA219 (`0x40` y `0x41`)
+
+Los integrados INA219 se instalan en configuración de **Lado Alto (*High-Side Sensing*)**, intercalados entre la fuente de tensión y la carga bajo ensayo.
+
+```text
+           +--------------------------------------------------------+
+           |                       FUENTE DC                        |
+           |                      (Hasta 26 V)                      |
+           +---------------------------+----------------------------+
+                                       | V+
+                                       |
+                                       v
+                                +--------------+
+                                | VIN+         |
+                                |   [Shunt]    |  INA219 #1 / #2
+                                | VIN-         |
+                                +-------+------+
+                                        |
+                                        v
+                               +----------------+
+                               |     CARGA      |
+                               |  (Bajo ensayo) |
+                               +--------+-------+
+                                        |
+                                        v
+                               +----------------+
+                               |  Retorno / GND |
+                               +----------------+
+```
+
+### Tabla de Pines del INA219
+
+| Pin Módulo INA219 | Conexión en Circuito | Función |
+| :--- | :--- | :--- |
+| **VCC** | +5V Arduino | Alimentación de la lógica interna |
+| **GND** | GND común Arduino | Masa digital y referencia de bus |
+| **SCL** | SCL Arduino (Pin 19) | Reloj I2C |
+| **SDA** | SDA Arduino (Pin 18) | Datos I2C |
+| **VIN+** | Borne positivo de la Fuente | Entrada al resistor Shunt ($0.1\,\Omega$ o $10\,\Omega$) |
+| **VIN-** | Entrada positiva a la Carga | Salida del resistor Shunt hacia la carga |
+
+---
+
+## 7. Módulo RTC DS3231 y Memoria EEPROM AT24C32
+
+Este módulo provee la base temporal para estampas cronológicas, el sensor térmico del cristal para compensación y la memoria no volátil EEPROM donde el software v0.9 PI almacena los factores $K$ y offsets con firma `PI09`.
+
+| Pin Módulo DS3231 | Conexión Arduino UNO R4 |
+| :--- | :--- |
+| **VCC** | +5V |
+| **GND** | GND |
+| **SDA** | SDA (Pin 18 / A4) |
+| **SCL** | SCL (Pin 19 / A5) |
+| **SQW / 32K** | *Sin conexión* (no requeridos en v0.9 PI) |
+
+---
+
+## 8. Tabla Resumen Pin a Pin del Arduino UNO R4 WiFi
+
+| Encabezado Arduino | Pin Físico | Conectado a | Notas Técnicas |
+| :--- | :--- | :--- | :--- |
+| **POWER** | `+5V` | VDD de todos los módulos | Riel general de $5\,\text{V}$ |
+| **POWER** | `GND` | Barra de Tierra Santa | Retorno único en estrella |
+| **JDIGITAL** | `SCL` (Pin 19) | Pin SCL de ADS1115 (x2), INA219 (x2), DS3231 | Pull-up activo de placa |
+| **JDIGITAL** | `SDA` (Pin 18) | Pin SDA de ADS1115 (x2), INA219 (x2), DS3231 | ADDR del ADS Clásico conectado aquí |
+| **JANALOG** | `A4 / A5` | *No utilizar como entradas analógicas* | Están unidas en silicio al bus I2C principal |
+
+---
+
+## 9. Recomendaciones Metrológicas para el Ruteo en PCB / Prototipado
+
+1. **Evitar bucles de masa (*Ground Loops*):** Conectar las tierras de señal analógica y de potencia en un único punto físico próximo a la bornera principal de masa.
+2. **Capacitores de desacoplo:** Instalar un capacitor cerámico multicapa (MLCC) de $100\,\text{nF}$ en paralelo con cada integrado entre sus pines `VDD` y `GND`, lo más cerca posible del encapsulado.
+3. **Impedancia de pistas I2C:** Mantener las pistas SDA y SCL lo más cortas y paralelas posible, alejadas de fuentes de conmutación electromagnética (como bobinas o conversores DC-DC).
+4. **Borneras de conexión:** Utilizar conectores de tornillo de paso $5.08\,\text{mm}$ o $3.81\,\text{mm}$ para las entradas de señal de prueba y shunts de corriente, previniendo falsos contactos mecánicos que degraden las lecturas.
